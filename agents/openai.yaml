@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Redundancy Triage"
+  short_description: "Assess redundant tests and decide keep, merge, or delete"
+  default_prompt: "Use $test-redundancy-triage to evaluate test redundancy and classify tests as keep, merge, or delete."
