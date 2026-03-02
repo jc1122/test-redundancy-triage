@@ -258,6 +258,22 @@ def infer_intent(test_name: str, entrypoint: str, assertions: set[str], src: str
         return "shape_dtype_contract"
     if "array_equality" in assertions or "topology_equality" in assertions:
         return "parity_equivalence"
+    # Mock/isolation tests
+    if "monkeypatch" in low or "mock" in low or "patch" in low:
+        return "mock_isolation"
+    # Lifecycle/cleanup tests
+    if "__del__" in low or "cleanup" in low or "teardown" in low or "lifecycle" in low:
+        return "lifecycle_contract"
+    # FFI/C-library tests
+    if "cdll" in low or "ctypes" in low or "ffi" in low or "library" in low or "lib_stream" in low:
+        return "ffi_contract"
+    # Check source for monkeypatch usage
+    if "monkeypatch" in src.lower():
+        return "mock_isolation"
+    if "ctypes" in src or "CDLL" in src or "_lib_stream" in src:
+        return "ffi_contract"
+    if "__del__" in src:
+        return "lifecycle_contract"
     return "shape_dtype_contract"
 
 
@@ -373,8 +389,19 @@ def discover_import_roots(base: Path) -> list[str]:
     return unique_preserve(roots)
 
 
-def build_runtime_env(root: Path, out_dir: Path, python_exe: str, *, allow_numba_stub: bool) -> dict[str, str]:
+def build_runtime_env(
+    root: Path,
+    out_dir: Path,
+    python_exe: str,
+    *,
+    allow_numba_stub: bool,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
+    # Merge user-provided environment variables first so they can influence
+    # subsequent steps (e.g. NUMBA_DISABLE_JIT, PATH overrides).
+    if extra_env:
+        env.update(extra_env)
     parts = []
     if allow_numba_stub:
         probe = run_cmd([python_exe, "-c", "import numba"], cwd=root, env=env, timeout=60)
@@ -1416,7 +1443,18 @@ def write_branch_equiv_artifacts(
     return branch_result_by_candidate, summary
 
 
-def bool_low_signal(meta: TestMeta, ranked: dict[str, str], coverage_row: dict[str, Any] | None) -> bool:
+def bool_low_signal(
+    meta: TestMeta,
+    ranked: dict[str, str],
+    coverage_row: dict[str, Any] | None,
+    *,
+    branch_equiv_row: dict | None = None,
+) -> bool:
+    # If branch-equivalence data shows this test has unique branches, it is NOT low-signal.
+    if branch_equiv_row is not None:
+        cand_only = as_int(branch_equiv_row.get("branch_candidate_only_count", 0))
+        if cand_only > 0:
+            return False
     if ranked:
         ul = int(ranked.get("unique_line_count", 0) or 0)
         ub = int(ranked.get("unique_branch_count", 0) or 0)
@@ -2218,6 +2256,13 @@ def main() -> int:
              "Format: [{\"probe_id\": \"P001\", \"file\": \"src/...\", \"old\": \"...\", \"new\": \"...\"}]. "
              "When omitted, no mutation probes are used and the mutation gate is skipped.",
     )
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="Extra environment variable in KEY=VALUE format. Repeatable. "
+             "Example: --env NUMBA_DISABLE_JIT=1 --env VIRTUAL_ENV=/path/to/venv",
+    )
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -2264,7 +2309,18 @@ def main() -> int:
             if inv:
                 t.assertion_types = inv
 
-    env = build_runtime_env(root, out_dir, python_exe, allow_numba_stub=bool(args.allow_numba_stub))
+    # Parse --env KEY=VALUE pairs into extra environment variables.
+    extra_env: dict[str, str] = {}
+    for kv in args.env:
+        key, _, value = kv.partition("=")
+        if key:
+            extra_env[key.strip()] = value.strip()
+
+    env = build_runtime_env(
+        root, out_dir, python_exe,
+        allow_numba_stub=bool(args.allow_numba_stub),
+        extra_env=extra_env or None,
+    )
     use_xdist = has_xdist_plugin(root, python_exe, env)
 
     # Always materialize core evidence artifacts for downstream workflows.
@@ -2392,11 +2448,23 @@ def main() -> int:
                 decision = "DELETE_SAFE_HIGH"
                 reason = f"deselect pass + near-duplicate source (sim={max_src_sim:.2f}) + dominated/low-signal"
             elif dominated or max_src_sim >= 0.80 or max_name_sim >= 0.85:
-                decision = "MERGE_RECOMMENDED"
-                reason = (
-                    f"deselect pass + overlap candidate "
-                    f"(dominated={dominated}, src_sim={max_src_sim:.2f}, name_sim={max_name_sim:.2f})"
-                )
+                # Guard: if the nearest neighbour is already parametrized, merging
+                # into it would create a false overlap signal after a prior merge.
+                nearest_peer = max(
+                    peers, key=lambda p: jaccard_sim(t.src_tokens, p.src_tokens)
+                ) if peers else None
+                if nearest_peer and nearest_peer.is_parametrized:
+                    decision = "KEEP_FOR_SIGNAL"
+                    reason = (
+                        f"nearest neighbor ({nearest_peer.test_name}) is parametrized; "
+                        "merge classification suppressed to avoid false overlap"
+                    )
+                else:
+                    decision = "MERGE_RECOMMENDED"
+                    reason = (
+                        f"deselect pass + overlap candidate "
+                        f"(dominated={dominated}, src_sim={max_src_sim:.2f}, name_sim={max_name_sim:.2f})"
+                    )
             else:
                 decision = "KEEP_FOR_SIGNAL"
                 reason = "deselect pass + distinct source and assertion signal"
@@ -2503,6 +2571,30 @@ def main() -> int:
         r["branch_candidate_only_count"] = branch.get("branch_candidate_only_count", "")
         r["branch_anchor_only_count"] = branch.get("branch_anchor_only_count", "")
         r["branch_status_note"] = branch.get("branch_status_note", "")
+
+    # Re-evaluate DELETE_SAFE_HIGH candidates with branch-equivalence evidence.
+    # A test that owns unique branches should not be flagged for deletion even
+    # if assertion-type dominance passed during the initial evaluation pass.
+    test_by_nodeid = {t.nodeid: t for t in tests}
+    for r in rows:
+        if r.get("validation_decision") != "DELETE_SAFE_HIGH":
+            continue
+        nodeid = str(r.get("test_nodeid", ""))
+        branch = branch_map.get(nodeid)
+        if not branch:
+            continue
+        t = test_by_nodeid.get(nodeid)
+        if not t:
+            continue
+        ranked = ranked_map.get(nodeid, {})
+        coverage_row = coverage_map.get(nodeid, {})
+        if not bool_low_signal(t, ranked, coverage_row, branch_equiv_row=branch):
+            r["validation_decision"] = "KEEP_FOR_SIGNAL"
+            r["validation_reason"] = (
+                f"branch-equiv re-evaluation: test has "
+                f"{branch.get('branch_candidate_only_count', 0)} unique branches; "
+                "not low-signal after branch-level analysis"
+            )
 
     confidence_tier_counts = write_confidence_gate_artifact(out_dir, rows)
 

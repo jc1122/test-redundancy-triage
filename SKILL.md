@@ -77,6 +77,10 @@ python scripts/triage_redundancy.py \
   # --allow-numba-stub   # optional: only if your suite requires numba fallback
 ```
 
+## Parallelism Note
+
+The triage script and TQA audit script are fully independent and can be run concurrently on separate terminals. For an orchestrated pipeline, see the `test-audit-pipeline` skill.
+
 ## Custom Mutation Probes
 
 The strict delete gate uses mutation probes to verify that the test suite detects injected faults.
@@ -174,3 +178,11 @@ others are automatically downgraded to keep decisions with strict failure notes.
 `mutation_baseline_status`, `mutation_batch_status`, `mutation_applied_probes`,
 and `mutation_failed_to_apply`.
 Use `candidate_validation.csv` as source of truth for automated change planning.
+
+## Known Limitations
+
+- **Mock-heavy tests**: Tests using monkeypatch, ctypes stubs, or similar mocking may be flagged as low-signal due to assertion-type dominance overshadowing branch-level uniqueness. Always cross-check DELETE candidates that mock internal state.
+- **Keyword-based intent inference**: Intent inference is keyword-based and may misclassify tests that don't follow naming conventions. Custom intent rules can be added to `infer_intent()` for project-specific patterns.
+- **Parametrized test conservatism**: Parametrized tests are conservatively kept (never auto-deleted). After merging tests into parametrized form, re-run triage to clear stale classifications.
+- **No per-variant analysis**: The script does not support per-variant analysis of parametrized tests. All variants are treated as a single test for coverage and branch equivalence.
+- **Environment variables**: Environment variables needed by the test suite (e.g., `NUMBA_DISABLE_JIT=1`) must be passed via `--env` or set in the calling shell.
