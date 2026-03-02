@@ -1,6 +1,11 @@
 ---
 name: test-redundancy-triage
-description: Investigate whether tests are redundant and decide concrete actions (delete, merge, keep-for-signal, keep-for-contract) using metaheuristics plus empirical deselection runs. Use when a repo has many overlapping tests, when a user asks which tests can be removed safely, or when test suites need pruning without losing behavioral coverage.
+description: >
+  Identify and safely remove redundant tests using empirical deselection,
+  branch-equivalence analysis, assertion dominance, and coverage/mutation
+  signals. Classifies each test as DELETE, MERGE, or KEEP with confidence
+  tiers (Gold/Silver/Bronze). Includes strict delete gates and cluster
+  safeguards to prevent accidental coverage loss.
 ---
 
 # Test Redundancy Triage
